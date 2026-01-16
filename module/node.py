@@ -5,7 +5,7 @@ import base64
 import requests
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
-from utils.apinode import bytesio_to_image_tensor, download_url_to_bytesio, tensor_to_data_uri
+from .utils.apinode import bytesio_to_image_tensor, download_url_to_bytesio, tensor_to_data_uri
 
 class ChatCompletionRequest(BaseModel):
     model: str
