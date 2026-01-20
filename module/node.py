@@ -295,42 +295,74 @@ class LLMImageGenerate():
         if not response.choices:
             raise ValueError("接口未返回可用的结果")
 
-        message = response.choices[0].message or {}
-        content = message.get("content")
-        image_url = None
+        # 收集所有 choices 中的图片 URL/base64，支持多张
+        image_urls_collected: List[str] = []
+        for choice in response.choices:
+            msg = choice.message or {}
+            urls = self._extract_image_urls(msg.get("content"))
+            if urls:
+                image_urls_collected.extend(urls)
 
-        if isinstance(content, list):
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") == "image_url":
-                    image_url = item.get("image_url", {}).get("url")
-                    if image_url:
-                        break
-        elif isinstance(content, dict):
-            if content.get("type") == "image_url":
-                image_url = content.get("image_url", {}).get("url")
-        elif isinstance(content, str):
-            image_url = content
-
-        if not image_url:
+        # 去掉空值
+        image_urls_collected = [u for u in image_urls_collected if u]
+        if not image_urls_collected:
             raise ValueError("接口未返回图片内容")
 
-        if image_url.startswith("http://") or image_url.startswith("https://"):
-            img_bytesio = await download_url_to_bytesio(image_url)
-        else:
-            if image_url.startswith("data:"):
-                _, _, encoded = image_url.partition(",")
+        # 逐张下载/解码并拼成批次
+        img_tensors = []
+        for url in image_urls_collected:
+            if url.startswith("http://") or url.startswith("https://"):
+                img_bytesio = await download_url_to_bytesio(url)
             else:
-                encoded = image_url
-            try:
-                img_bytes = base64.b64decode(encoded)
-            except Exception as exc:
-                raise ValueError("返回的图片内容不是有效的 Base64 数据") from exc
-            img_bytesio = io.BytesIO(img_bytes)
+                if url.startswith("data:"):
+                    _, _, encoded = url.partition(",")
+                else:
+                    encoded = url
+                try:
+                    img_bytes = base64.b64decode(encoded)
+                except Exception as exc:
+                    raise ValueError("返回的图片内容不是有效的 Base64 数据") from exc
+                img_bytesio = io.BytesIO(img_bytes)
+            img_tensor = bytesio_to_image_tensor(img_bytesio)
+            img_tensors.append(img_tensor)
 
-        img_tensor = bytesio_to_image_tensor(img_bytesio)
-        return (img_tensor, request_json, json.dumps(response.model_dump(), ensure_ascii=False, indent=2))
+        batch_tensor = torch.cat(img_tensors, dim=0)
+        return (batch_tensor, request_json, json.dumps(response.model_dump(), ensure_ascii=False, indent=2))
+
+    def _extract_image_urls(self, content):
+        urls = []
+        if content is None:
+            return urls
+
+        if isinstance(content, str):
+            urls.append(content)
+        elif isinstance(content, dict):
+            if content.get("type") == "image_url":
+                url_val = content.get("image_url", {})
+                if isinstance(url_val, dict):
+                    maybe = url_val.get("url")
+                    if maybe:
+                        urls.append(maybe)
+                elif isinstance(url_val, str):
+                    urls.append(url_val)
+            elif "url" in content:
+                urls.append(content.get("url"))
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, str):
+                    urls.append(item)
+                elif isinstance(item, dict):
+                    if item.get("type") == "image_url":
+                        url_val = item.get("image_url", {})
+                        if isinstance(url_val, dict):
+                            maybe = url_val.get("url")
+                            if maybe:
+                                urls.append(maybe)
+                        elif isinstance(url_val, str):
+                            urls.append(url_val)
+                    elif "url" in item:
+                        urls.append(item.get("url"))
+        return urls
 
 
 class LLMResponseImageParser:
