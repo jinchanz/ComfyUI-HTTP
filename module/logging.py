@@ -22,7 +22,7 @@ class ColoredFormatter(logging.Formatter):
 
 
 # Create a new logger
-logger = logging.getLogger("MiniMaxVideo")
+logger = logging.getLogger("ComfyUI-HTTP")
 logger.propagate = False
 
 # Add handler if we don't have one.
