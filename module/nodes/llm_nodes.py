@@ -9,7 +9,7 @@ import requests
 from typing import Any, Dict, List
 
 from ..models import ChatCompletionRequest, ChatCompletionResponse
-from ..utils.apinode import bytesio_to_image_tensor, download_url_to_bytesio, tensor_to_data_uri
+from ..utils.apinode import bytesio_to_image_tensor, download_url_to_bytesio, tensor_to_data_uri, build_api_url
 
 class LLMImageGenerate():
     """
@@ -143,7 +143,7 @@ class LLMImageGenerate():
         if auth_token:
             auth_kwargs["auth_token"] = auth_token
 
-        url = api_base.rstrip("/") + path
+        url = build_api_url(api_base, path)
         _headers = {
             "Content-Type": "application/json",
             "Accept": "*/*",
@@ -731,7 +731,7 @@ class LLMSmartGenerate():
         if auth_token:
             auth_kwargs["auth_token"] = auth_token
 
-        url = api_base.rstrip("/") + path
+        url = build_api_url(api_base, path)
         _headers = {
             "Content-Type": "application/json",
             "Accept": "*/*",
@@ -1042,4 +1042,159 @@ class LLMSmartGenerate():
                     elif item.get("type") == "audio" and "url" in item:
                         urls.append(item.get("url"))
         return urls
+
+
+class LLMResponseSmartParser(LLMSmartGenerate):
+    """
+    智能 LLM 响应解析节点 - 从 response JSON 中解析文本、图片、视频、音频。
+
+    输出结构与 LLMSmartGenerate 后半段保持一致，便于在仅有 response 的场景复用。
+    """
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "response": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": "LLM API 返回的 JSON 响应字符串",
+                    },
+                ),
+            },
+            "optional": {
+                "output_mode": (
+                    ["auto", "text_only", "image_only", "video_only", "audio_only", "multimodal"],
+                    {
+                        "default": "auto",
+                        "tooltip": "输出模式：auto（自动检测），text_only（仅文本），image_only（仅图片），video_only（仅视频），audio_only（仅音频），multimodal（全部）"
+                    }
+                ),
+                "timeout": (
+                    "INT",
+                    {
+                        "default": 60,
+                        "min": 1,
+                        "max": 600,
+                        "tooltip": "下载图片的超时时间（秒）",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE", "VIDEO", "AUDIO", "BOOLEAN", "BOOLEAN", "BOOLEAN")
+    RETURN_NAMES = ("text", "image", "video", "audio", "has_image", "has_video", "has_audio")
+    FUNCTION = "parse_response"
+    CATEGORY = "api node/llm/smart"
+
+    async def parse_response(self, response, output_mode="auto", timeout=60):
+        try:
+            if isinstance(response, str):
+                response_data = json.loads(response)
+            else:
+                response_data = response
+        except json.JSONDecodeError as e:
+            raise ValueError(f"无效的 JSON 响应: {str(e)}")
+
+        if not isinstance(response_data, dict):
+            raise ValueError("response 必须是 JSON 对象")
+
+        choices = response_data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("响应中缺少有效的 choices")
+
+        text_content = ""
+        image_urls_collected: List[str] = []
+        video_urls_collected: List[str] = []
+        audio_urls_collected: List[str] = []
+
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+
+            msg = choice.get("message") or {}
+            content = msg.get("content")
+
+            text_parts = self._extract_text_content(content)
+            if text_parts:
+                if text_content:
+                    text_content += "\n"
+                text_content += "\n".join(text_parts)
+
+            if output_mode not in ["text_only", "video_only", "audio_only"]:
+                image_urls = self._extract_image_urls(content)
+                if image_urls:
+                    image_urls_collected.extend(image_urls)
+
+            if output_mode not in ["text_only", "image_only", "audio_only"]:
+                video_urls = self._extract_video_urls(content)
+                if video_urls:
+                    video_urls_collected.extend(video_urls)
+
+            if output_mode not in ["text_only", "image_only", "video_only"]:
+                audio_urls = self._extract_audio_urls(content)
+                if audio_urls:
+                    audio_urls_collected.extend(audio_urls)
+
+        has_image = False
+        image_urls_collected = [url for url in image_urls_collected if url]
+        image_tensor = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+
+        if image_urls_collected:
+            img_tensors = []
+            for image_url in image_urls_collected:
+                try:
+                    if image_url.startswith("http://") or image_url.startswith("https://"):
+                        img_bytesio = await download_url_to_bytesio(image_url, timeout)
+                    else:
+                        if image_url.startswith("data:"):
+                            _, _, encoded = image_url.partition(",")
+                        else:
+                            encoded = image_url
+                        img_bytes = base64.b64decode(encoded)
+                        img_bytesio = io.BytesIO(img_bytes)
+
+                    img_tensor = bytesio_to_image_tensor(img_bytesio)
+                    img_tensors.append(img_tensor)
+                except Exception:
+                    continue
+
+            if img_tensors:
+                image_tensor = torch.cat(img_tensors, dim=0)
+                has_image = True
+
+        has_video = False
+        video_urls_collected = [url for url in video_urls_collected if url]
+        video_output = {"type": "none", "urls": []}
+        if video_urls_collected:
+            has_video = True
+            video_output = {
+                "type": "video_urls",
+                "urls": video_urls_collected,
+            }
+
+        has_audio = False
+        audio_urls_collected = [url for url in audio_urls_collected if url]
+        audio_output = {"type": "none", "urls": []}
+        if audio_urls_collected:
+            has_audio = True
+            audio_output = {
+                "type": "audio_urls",
+                "urls": audio_urls_collected,
+            }
+
+        return (
+            text_content or "",
+            image_tensor,
+            video_output,
+            audio_output,
+            has_image,
+            has_video,
+            has_audio,
+        )
 

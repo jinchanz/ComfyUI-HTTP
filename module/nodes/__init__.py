@@ -2,7 +2,7 @@
 节点模块 - 导出所有节点类
 """
 from .http_nodes import COMMON_HTTP_REQUEST, POLLING_HTTP_REQUEST
-from .llm_nodes import LLMImageGenerate, LLMSmartGenerate, LLMResponseImageParser
+from .llm_nodes import LLMImageGenerate, LLMSmartGenerate, LLMResponseImageParser, LLMResponseSmartParser
 from .utility_nodes import TextConcatenate, ImageBatchMerge
 
 __all__ = [
@@ -13,6 +13,7 @@ __all__ = [
     'LLMImageGenerate',
     'LLMSmartGenerate',
     'LLMResponseImageParser',
+    'LLMResponseSmartParser',
     # 工具节点
     'TextConcatenate',
     'ImageBatchMerge',

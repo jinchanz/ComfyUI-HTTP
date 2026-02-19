@@ -77,3 +77,65 @@ def bytesio_to_image_tensor(image_bytesio: io.BytesIO, mode: str = "RGBA") -> to
     image = image.convert(mode)
     image_array = np.array(image).astype(np.float32) / 255.0
     return torch.from_numpy(image_array).unsqueeze(0)
+
+
+def build_api_url(api_base: str, path: str) -> str:
+    """智能构建 API URL，支持多种输入格式
+
+    Args:
+        api_base: API 基础地址，可以是：
+            - 完整 URL: "https://api.example.com/v1/chat/completions"
+            - 包含路径的 base: "https://api.example.com/v1"
+            - 纯域名: "https://api.example.com"
+        path: 要拼接的路径，如 "/v1/chat/completions"
+
+    Returns:
+        完整的 API URL
+
+    Examples:
+        >>> build_api_url("https://api.example.com", "/v1/chat/completions")
+        "https://api.example.com/v1/chat/completions"
+
+        >>> build_api_url("https://api.example.com/v1", "/v1/chat/completions")
+        "https://api.example.com/v1/chat/completions"
+
+        >>> build_api_url("https://api.example.com/v1/chat/completions", "/v1/chat/completions")
+        "https://api.example.com/v1/chat/completions"
+    """
+    if not api_base:
+        raise ValueError("api_base 不能为空")
+
+    # 标准化 path（确保以 / 开头）
+    if path and not path.startswith("/"):
+        path = "/" + path
+
+    # 移除 api_base 末尾的斜杠
+    api_base = api_base.rstrip("/")
+
+    # 场景 1: api_base 已经是完整的 URL（包含了完整的端点路径）
+    # 检查是否已经包含了目标路径
+    if path and api_base.endswith(path):
+        return api_base
+
+    # 场景 2: api_base 已经包含了 path 的部分路径
+    # 例如: api_base="xxx/v1", path="/v1/chat/completions"
+    # 提取 path 中 /v1/ 之后的部分
+    if "/v1/" in api_base and path.startswith("/v1/"):
+        # api_base 已经包含 /v1/，只拼接 /v1/ 后面的部分
+        remaining_path = path.split("/v1/", 1)[-1]
+        if remaining_path:
+            return f"{api_base}/{remaining_path}"
+        return api_base
+
+    # 场景 3: 检查是否有其他版本路径重复（如 /v2/, /api/ 等）
+    # 提取 path 的第一个有意义的路径段
+    path_parts = [p for p in path.split("/") if p]
+    if path_parts and api_base.endswith(f"/{path_parts[0]}"):
+        # api_base 已经包含了 path 的第一个路径段
+        remaining_parts = path_parts[1:]
+        if remaining_parts:
+            return f"{api_base}/{'/'.join(remaining_parts)}"
+        return api_base
+
+    # 场景 4: 标准拼接
+    return api_base + path

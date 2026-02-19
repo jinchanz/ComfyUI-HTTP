@@ -7,6 +7,7 @@ from .nodes import (
     LLMImageGenerate,
     LLMSmartGenerate,
     LLMResponseImageParser,
+    LLMResponseSmartParser,
     TextConcatenate,
     ImageBatchMerge,
 )
@@ -17,6 +18,7 @@ NODE_CLASS_MAPPINGS = {
     "LLMImageGenerate": LLMImageGenerate,
     "LLMSmartGenerate": LLMSmartGenerate,
     "LLMResponseImageParser": LLMResponseImageParser,
+    "LLMResponseSmartParser": LLMResponseSmartParser,
     "POLLING_HTTP_REQUEST": POLLING_HTTP_REQUEST,
     "MaletteTextConcatenate": TextConcatenate,
     "MaletteImageBatchMerge": ImageBatchMerge,
@@ -28,6 +30,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LLMImageGenerate": "LLM 图像生成",
     "LLMSmartGenerate": "LLM 智能生成",
     "LLMResponseImageParser": "LLM响应图片解析",
+    "LLMResponseSmartParser": "LLM响应智能解析",
     "POLLING_HTTP_REQUEST": "轮询HTTP请求",
     "MaletteTextConcatenate": "文本拼接",
     "MaletteImageBatchMerge": "图片批次合并",
