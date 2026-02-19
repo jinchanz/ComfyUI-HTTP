@@ -134,8 +134,8 @@ class LLMImageGenerate():
             ],
             stream=False,
             modalities=[
-                "TEXT",
-                "IMAGE"
+                "text",
+                "image"
             ],
             extendParams=json.loads(extendParams) if extendParams and extendParams.strip() else None,
         )
@@ -685,19 +685,19 @@ class LLMSmartGenerate():
         # 构建请求
         path = "/v1/chat/completions"
 
-        # 根据输出模式设置 modalities
+        # 根据输出模式设置 modalities（使用小写，符合 OpenAI API 规范）
         if output_mode == "text_only":
-            modalities = ["TEXT"]
+            modalities = ["text"]
         elif output_mode == "image_only":
-            modalities = ["IMAGE"]
+            modalities = ["image"]
         elif output_mode == "video_only":
-            modalities = ["VIDEO"]
+            modalities = ["video"]
         elif output_mode == "audio_only":
-            modalities = ["AUDIO"]
+            modalities = ["audio"]
         elif output_mode == "multimodal":
-            modalities = ["TEXT", "IMAGE", "VIDEO", "AUDIO"]
-        else:  # auto
-            modalities = ["TEXT", "IMAGE", "VIDEO", "AUDIO"]
+            modalities = ["text", "image", "video", "audio"]
+        else:  # auto - 使用保守设置，避免 API 不支持某些模态
+            modalities = ["text", "image"]
 
         # 构建基础请求参数
         request_params = {
@@ -715,11 +715,12 @@ class LLMSmartGenerate():
             "top_p": top_p,
         }
 
-        # 合并 extendParams
+        # 合并 extendParams（可以覆盖 modalities）
         if extendParams and extendParams.strip():
             try:
                 extra_params = json.loads(extendParams)
                 if isinstance(extra_params, dict):
+                    # extendParams 可以覆盖 modalities
                     request_params.update(extra_params)
             except json.JSONDecodeError as e:
                 raise ValueError(f"extendParams JSON 解析失败: {str(e)}")
@@ -755,6 +756,8 @@ class LLMSmartGenerate():
                 timeout=timeout,
                 verify=False,
             )
+            print(f"[LLMSmartGenerate] 请求结果: {response_http.status_code}")
+            print(f"[LLMSmartGenerate] 响应内容: {response_http.content[:500]}")  # 打印前500字符以查看响应内容
             response_http.raise_for_status()
             response_json = response_http.json()
             response = ChatCompletionResponse.model_validate(response_json)
