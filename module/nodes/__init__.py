@@ -1,7 +1,7 @@
 """
 节点模块 - 导出所有节点类
 """
-from .http_nodes import COMMON_HTTP_REQUEST, POLLING_HTTP_REQUEST
+from .http_nodes import COMMON_HTTP_REQUEST, POLLING_HTTP_REQUEST, ASYNC_TASK_HTTP_REQUEST, CONCURRENT_HTTP_REQUEST
 from .llm_nodes import LLMImageGenerate, LLMSmartGenerate, LLMResponseImageParser, LLMResponseSmartParser
 from .utility_nodes import TextConcatenate, ImageBatchMerge
 
@@ -9,6 +9,8 @@ __all__ = [
     # HTTP 节点
     'COMMON_HTTP_REQUEST',
     'POLLING_HTTP_REQUEST',
+    'ASYNC_TASK_HTTP_REQUEST',
+    'CONCURRENT_HTTP_REQUEST',
     # LLM 节点
     'LLMImageGenerate',
     'LLMSmartGenerate',

@@ -11,6 +11,26 @@ from typing import Any, Dict, List
 from ..models import ChatCompletionRequest, ChatCompletionResponse
 from ..utils.apinode import bytesio_to_image_tensor, download_url_to_bytesio, tensor_to_data_uri, build_api_url
 
+
+def _apply_sampling_settings(request_params: Dict[str, Any], sampling_mode: str, temperature: float, top_p: float):
+    """根据兼容性设置决定是否发送 temperature/top_p。"""
+    request_params.pop("temperature", None)
+    request_params.pop("top_p", None)
+
+    if sampling_mode == "temperature_only":
+        request_params["temperature"] = temperature
+    elif sampling_mode == "top_p_only":
+        request_params["top_p"] = top_p
+    elif sampling_mode == "disabled":
+        return
+    else:
+        request_params["temperature"] = temperature
+        request_params["top_p"] = top_p
+
+
+def _dump_request_json(request: ChatCompletionRequest) -> str:
+    return request.model_dump_json(exclude_none=True)
+
 class LLMImageGenerate():
     """
     Generates images synchronously via OpenAI like(LLM) API.
@@ -66,6 +86,13 @@ class LLMImageGenerate():
                 "auth_token": ("STRING", {"default": "", "tooltip": "Bearer Token"}),
                 "headers": ("STRING", {"default": ""}),
                 "timeout": ("INT", {"default": 600, "min": 1, "max": 3600}),
+                "use_modalities": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "是否发送 modalities 字段；关闭可兼容不支持该字段的模型",
+                    },
+                ),
                 "extendParams": ("STRING", {"default": ""}),
             },
         }
@@ -87,6 +114,7 @@ class LLMImageGenerate():
         auth_token="",
         headers="",
         timeout=600,
+        use_modalities=True,
         extendParams="",
         **kwargs,
     ):
@@ -124,7 +152,7 @@ class LLMImageGenerate():
             raise ValueError("请至少提供文本或图片中的一种输入")
 
         path = "/v1/chat/completions"
-        request = ChatCompletionRequest(
+        request_params = dict(
             model=model or "gemini-3-pro-image-preview",
             messages=[
                 {
@@ -133,12 +161,14 @@ class LLMImageGenerate():
                 }
             ],
             stream=False,
-            modalities=[
-                "text",
-                "image"
-            ],
             extendParams=json.loads(extendParams) if extendParams and extendParams.strip() else None,
         )
+        if use_modalities:
+            request_params["modalities"] = [
+                "text",
+                "image"
+            ]
+        request = ChatCompletionRequest(**request_params)
         auth_kwargs = dict(kwargs) if kwargs else {}
         if auth_token:
             auth_kwargs["auth_token"] = auth_token
@@ -157,12 +187,12 @@ class LLMImageGenerate():
                 raise ValueError(f"headers参数JSON解析失败: {str(e)}")
         if "auth_token" in auth_kwargs and auth_kwargs["auth_token"]:
             _headers["Authorization"] = f"Bearer {auth_kwargs['auth_token']}"
-        request_json = request.model_dump_json()
+        request_json = _dump_request_json(request)
         try:
             response_http = requests.post(
                 url,
                 headers=_headers,
-                json=json.loads(request.model_dump_json()),
+                json=json.loads(request_json),
                 timeout=timeout,
                 verify=False,
             )
@@ -533,6 +563,20 @@ class LLMSmartGenerate():
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.1, "tooltip": "控制生成随机性，0=确定性，2=最随机"}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "核采样参数"}),
                 "stream": ("BOOLEAN", {"default": False, "tooltip": "是否启用流式输出（实验性）"}),
+                "use_modalities": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "是否发送 modalities 字段；关闭可兼容不支持该字段的模型",
+                    },
+                ),
+                "sampling_mode": (
+                    ["temperature_and_top_p", "temperature_only", "top_p_only", "disabled"],
+                    {
+                        "default": "temperature_and_top_p",
+                        "tooltip": "控制是否发送 temperature/top_p；部分模型不允许两者同时出现",
+                    }
+                ),
                 "extendParams": ("STRING", {"default": "", "tooltip": "额外的 JSON 参数"}),
                 "output_mode": (
                     ["auto", "text_only", "image_only", "video_only", "audio_only", "multimodal"],
@@ -571,6 +615,8 @@ class LLMSmartGenerate():
         temperature=0.7,
         top_p=0.9,
         stream=False,
+        use_modalities=True,
+        sampling_mode="temperature_and_top_p",
         extendParams="",
         output_mode="auto",
         **kwargs,
@@ -709,21 +755,24 @@ class LLMSmartGenerate():
                 }
             ],
             "stream": stream,
-            "modalities": modalities,
             "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
         }
+        if use_modalities:
+            request_params["modalities"] = modalities
 
         # 合并 extendParams（可以覆盖 modalities）
         if extendParams and extendParams.strip():
             try:
                 extra_params = json.loads(extendParams)
                 if isinstance(extra_params, dict):
-                    # extendParams 可以覆盖 modalities
                     request_params.update(extra_params)
             except json.JSONDecodeError as e:
                 raise ValueError(f"extendParams JSON 解析失败: {str(e)}")
+
+        if not use_modalities:
+            request_params.pop("modalities", None)
+
+        _apply_sampling_settings(request_params, sampling_mode, temperature, top_p)
 
         request = ChatCompletionRequest(**request_params)
 
@@ -746,13 +795,13 @@ class LLMSmartGenerate():
         if "auth_token" in auth_kwargs and auth_kwargs["auth_token"]:
             _headers["Authorization"] = f"Bearer {auth_kwargs['auth_token']}"
 
-        request_json = request.model_dump_json()
+        request_json = _dump_request_json(request)
 
         try:
             response_http = requests.post(
                 url,
                 headers=_headers,
-                json=json.loads(request.model_dump_json()),
+                json=json.loads(request_json),
                 timeout=timeout,
                 verify=False,
             )

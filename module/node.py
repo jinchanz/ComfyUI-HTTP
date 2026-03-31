@@ -4,6 +4,8 @@
 from .nodes import (
     COMMON_HTTP_REQUEST,
     POLLING_HTTP_REQUEST,
+    ASYNC_TASK_HTTP_REQUEST,
+    CONCURRENT_HTTP_REQUEST,
     LLMImageGenerate,
     LLMSmartGenerate,
     LLMResponseImageParser,
@@ -20,6 +22,8 @@ NODE_CLASS_MAPPINGS = {
     "LLMResponseImageParser": LLMResponseImageParser,
     "LLMResponseSmartParser": LLMResponseSmartParser,
     "POLLING_HTTP_REQUEST": POLLING_HTTP_REQUEST,
+    "ASYNC_TASK_HTTP_REQUEST": ASYNC_TASK_HTTP_REQUEST,
+    "CONCURRENT_HTTP_REQUEST": CONCURRENT_HTTP_REQUEST,
     "MaletteTextConcatenate": TextConcatenate,
     "MaletteImageBatchMerge": ImageBatchMerge,
 }
@@ -32,6 +36,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LLMResponseImageParser": "LLM响应图片解析",
     "LLMResponseSmartParser": "LLM响应智能解析",
     "POLLING_HTTP_REQUEST": "轮询HTTP请求",
+    "ASYNC_TASK_HTTP_REQUEST": "异步任务HTTP请求",
+    "CONCURRENT_HTTP_REQUEST": "并发HTTP请求",
     "MaletteTextConcatenate": "文本拼接",
     "MaletteImageBatchMerge": "图片批次合并",
 }
