@@ -10,6 +10,9 @@ from typing import Any, Dict, List
 
 from ..models import ChatCompletionRequest, ChatCompletionResponse
 from ..utils.apinode import bytesio_to_image_tensor, download_url_to_bytesio, tensor_to_data_uri, build_api_url
+# 复用 http_nodes 中带 TCP Keepalive 的全局 Session，避免 LLM 长生成场景下
+# 链路被 LB/SLB/NAT 在 ~90s 静默断开导致的 abort。
+from .http_nodes import HTTP_SESSION, _truncate_for_log
 
 
 def _apply_sampling_settings(request_params: Dict[str, Any], sampling_mode: str, temperature: float, top_p: float):
@@ -189,13 +192,15 @@ class LLMImageGenerate():
             _headers["Authorization"] = f"Bearer {auth_kwargs['auth_token']}"
         request_json = _dump_request_json(request)
         try:
-            response_http = requests.post(
+            # 使用带 TCP Keepalive 的全局 Session，规避长生成时链路 idle 超时
+            response_http = HTTP_SESSION.post(
                 url,
                 headers=_headers,
                 json=json.loads(request_json),
                 timeout=timeout,
                 verify=False,
             )
+            print(f"[LLMImageGenerate] 响应状态码: {response_http.status_code}")
             response_http.raise_for_status()
             response_json = response_http.json()
             response = ChatCompletionResponse.model_validate(response_json)
@@ -798,15 +803,16 @@ class LLMSmartGenerate():
         request_json = _dump_request_json(request)
 
         try:
-            response_http = requests.post(
+            # 使用带 TCP Keepalive 的全局 Session，规避长生成时链路 idle 超时
+            response_http = HTTP_SESSION.post(
                 url,
                 headers=_headers,
                 json=json.loads(request_json),
                 timeout=timeout,
                 verify=False,
             )
-            print(f"[LLMSmartGenerate] 请求结果: {response_http.status_code}")
-            print(f"[LLMSmartGenerate] 响应内容: {response_http.content[:500]}")  # 打印前500字符以查看响应内容
+            print(f"[LLMSmartGenerate] 响应状态码: {response_http.status_code}")
+            print(f"[LLMSmartGenerate] 响应预览: {_truncate_for_log(response_http.text)}")
             response_http.raise_for_status()
             response_json = response_http.json()
             response = ChatCompletionResponse.model_validate(response_json)

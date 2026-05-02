@@ -2,9 +2,125 @@
 HTTP 请求相关节点
 """
 import json
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+class _KeepAliveAdapter(HTTPAdapter):
+    """
+    自定义 HTTPAdapter，在底层 socket 上启用 TCP Keepalive。
+
+    背景：
+        当请求 FaaS / LLM / 长耗时同步服务时，链路上的 LB / SLB / NAT / 防火墙
+        通常存在 60s~300s 的 idle connection timeout。一旦 TCP 连接长时间无数据
+        流动（函数执行中尚未返回响应），中间设备会静默回收连接表，导致客户端
+        看到固定的 ~90s abort。
+        通过启用 SO_KEEPALIVE 并调小探测间隔，可让 OS 在 TCP 层周期性发送
+        keepalive 探测包，避免连接被中间设备视为 idle。
+    """
+
+    def init_poolmanager(self, *args, **kwargs):
+        socket_options = [
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        ]
+        # Linux: 完整的 keepalive 三参数
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            socket_options.append((socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30))
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            socket_options.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10))
+        if hasattr(socket, "TCP_KEEPCNT"):
+            socket_options.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 6))
+        # macOS: 仅有 TCP_KEEPALIVE（等价于 TCP_KEEPIDLE）
+        if not hasattr(socket, "TCP_KEEPIDLE") and hasattr(socket, "TCP_KEEPALIVE"):
+            socket_options.append((socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30))
+
+        kwargs["socket_options"] = socket_options
+        super().init_poolmanager(*args, **kwargs)
+
+
+def _build_retry_policy():
+    """
+    构造 urllib3 重试策略，专门处理"连接池里的半死连接"问题。
+
+    背景（ComfyUI worker 长驻场景）：
+        worker 是常驻进程，工作流之间可能间隔几分钟到几小时。在这段空闲期里，
+        连接池中复用的 keep-alive 连接会被以下角色静默杀掉：
+        - 服务端 keep-alive timeout (Nginx 75s / Tomcat 60s ...)
+        - SLB / NAT / 防火墙的连接表回收（60s ~ 300s）
+        - 家用路由器/企业 NAT 的 idle 清理
+        客户端拿出半死连接发出第一个字节时，会得到 ConnectionResetError /
+        RemoteDisconnected / ProtocolError。urllib3 的 Retry 机制能识别这类
+        "连接层"错误并自动重发到一条新连接上，对业务完全透明。
+
+    安全边界（绝不能引入业务副作用）：
+        - status_forcelist=()       —— 不对任何业务 HTTP 状态码（4xx/5xx）重试，
+                                       避免重复扣费 / 重复下单 / 重复创建任务。
+        - allowed_methods=False     —— 配合 total，只对"连接级"错误重试所有方法。
+                                       关键点：connect=2 + read=0 意味着只重试
+                                       "TCP 还没建立成功" 的失败；一旦请求字节
+                                       已经发出去，read 失败不会重试，POST 完全
+                                       安全（服务端要么没收到，要么已处理，不会
+                                       被重复执行）。
+        - backoff_factor=0.3        —— 退避 0s / 0.6s，足够等服务端清理半死连接，
+                                       又不会显著拉长用户感知耗时。
+    """
+    return Retry(
+        total=2,
+        connect=2,        # 连接建立失败重试 2 次（绝对安全，服务端没收到请求）
+        read=0,           # 已发送请求后读响应失败不重试（避免业务重复）
+        redirect=0,       # 不自动跟随重定向，由调用方/服务端控制
+        status=0,         # 不对状态码做重试
+        status_forcelist=(),
+        allowed_methods=False,  # 配合 connect/read 区分，对所有方法启用上述策略
+        backoff_factor=0.3,
+        raise_on_status=False,
+        respect_retry_after_header=False,
+    )
+
+
+def _build_keepalive_session(pool_connections=20, pool_maxsize=50):
+    """构造带 TCP Keepalive + 连接级自动重试的全局 requests.Session"""
+    session = requests.Session()
+    adapter = _KeepAliveAdapter(
+        pool_connections=pool_connections,
+        pool_maxsize=pool_maxsize,
+        # 用 urllib3 Retry 让 adapter 在"半死连接"场景下自动透明重连
+        max_retries=_build_retry_policy(),
+        # 池满时不阻塞，直接新建连接，避免 worker 因池里全是半死连接而卡死
+        pool_block=False,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+# 全局共享的 Session，所有节点统一通过它发请求，
+# 享受 TCP Keepalive + 连接池复用 + 半死连接自动恢复带来的稳定性收益。
+#
+# 三道防线：
+#   1) TCP Keepalive   —— 防止"请求执行中"被中间设备误判 idle 而杀掉
+#   2) urllib3 Retry   —— 处理"池中复用的连接已被对端/中间设备静默清理"
+#   3) pool_block=False —— 池满时新建连接，避免被半死连接拖垮整个 worker
+HTTP_SESSION = _build_keepalive_session()
+
+# 日志截断长度。响应体可能包含 base64 图片/长文本，全量打印会显著拖慢 IDE 控制台、
+# 干扰问题排查，且 ComfyUI 控制台对超长行的渲染开销很大。
+_LOG_PREVIEW_LIMIT = 200
+
+
+def _truncate_for_log(value, limit=_LOG_PREVIEW_LIMIT):
+    """将任意值转为字符串并截断，用于日志预览，避免长响应刷屏。"""
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...(truncated, total {len(text)} chars)"
 
 
 def _parse_json_input(value, field_name, default=None):
@@ -183,10 +299,10 @@ class COMMON_HTTP_REQUEST:
                 except json.JSONDecodeError as e:
                     raise ValueError(f"headers参数JSON解析失败: {str(e)}")
 
-            print(f"[COMMON_HTTP_REQUEST] 请求参数: {json.dumps(request_body, ensure_ascii=False)}")
+            print(f"[COMMON_HTTP_REQUEST] 请求参数: {_truncate_for_log(json.dumps(request_body, ensure_ascii=False))}")
 
-            # 发送POST请求
-            response = requests.request(
+            # 发送POST请求（使用带 TCP Keepalive 的全局 Session，避免链路 idle 超时）
+            response = HTTP_SESSION.request(
                 method,
                 api_endpoint.strip(),
                 headers=real_headers,
@@ -201,9 +317,9 @@ class COMMON_HTTP_REQUEST:
             # 解析响应
             response_data = response.json()
 
-            # 返回成功结果
+            # 返回成功结果（完整结果用于下游节点；日志只打印预览，避免大响应刷屏）
             result_json = json.dumps(response_data, ensure_ascii=False, indent=2)
-            print(f"[COMMON_HTTP_REQUEST] 请求结果: {result_json}")
+            print(f"[COMMON_HTTP_REQUEST] 请求结果: {_truncate_for_log(result_json)}")
 
             return (result_json,)
 
@@ -309,8 +425,8 @@ class POLLING_HTTP_REQUEST:
                 print(f"[POLLING_HTTP_REQUEST] 第 {attempt}/{max_attempts} 次轮询...")
 
                 try:
-                    # 发送请求
-                    response = requests.request(
+                    # 发送请求（使用带 TCP Keepalive 的全局 Session）
+                    response = HTTP_SESSION.request(
                         method,
                         api_endpoint.strip(),
                         headers=real_headers,
@@ -319,7 +435,7 @@ class POLLING_HTTP_REQUEST:
                         timeout=timeout,
                         verify=False
                     )
-                    print(f"[POLLING_HTTP_REQUEST] 响应状态码: {response}")
+                    print(f"[POLLING_HTTP_REQUEST] 响应状态码: {response.status_code}")
                     # 检查HTTP状态码
                     if success_condition == "status_code_only":
                         if response.status_code == 200:
@@ -336,7 +452,7 @@ class POLLING_HTTP_REQUEST:
                         if response.status_code < 200 or response.status_code >= 300:
                             last_status = f"HTTP {response.status_code}"
                             last_response = response.text
-                            print(f"[POLLING_HTTP_REQUEST] HTTP {response.status_code}: {response.text[:100]}")
+                            print(f"[POLLING_HTTP_REQUEST] HTTP {response.status_code}: {_truncate_for_log(response.text)}")
                         else:
                             # 解析响应
                             try:
@@ -347,10 +463,8 @@ class POLLING_HTTP_REQUEST:
                                 last_response = response.text
                                 response_data = {"raw_response": response.text}
 
-                        # 检查成功条件（仅在HTTP状态码正常时）
-                        if response.status_code >= 200 and response.status_code < 300:
+                            # 检查成功条件（仅在HTTP状态码正常时）
                             if success_condition == "status_field":
-                                # 通过字段路径获取值
                                 current_value = _get_nested_value(response_data, condition_field)
                                 last_status = str(current_value) if current_value is not None else "无法获取状态"
 
@@ -369,27 +483,6 @@ class POLLING_HTTP_REQUEST:
                                     success = True
                                     print(f"[POLLING_HTTP_REQUEST] ✓ 满足条件")
                                     break
-
-                        # 检查成功条件
-                        if success_condition == "status_field":
-                            current_value = _get_nested_value(response_data, condition_field)
-                            last_status = str(current_value) if current_value is not None else "无法获取状态"
-
-                            if current_value == expected_value or str(current_value) == expected_value:
-                                success = True
-                                print(f"[POLLING_HTTP_REQUEST] ✓ 成功: {condition_field}={current_value}")
-                                break
-                            else:
-                                print(f"[POLLING_HTTP_REQUEST] 当前状态: {condition_field}={current_value}, 期望: {expected_value}")
-
-                        elif success_condition == "custom_jsonpath":
-                            current_value = _get_nested_value(response_data, condition_field)
-                            last_status = str(current_value) if current_value is not None else "无法获取状态"
-
-                            if _check_condition(current_value, expected_value):
-                                success = True
-                                print(f"[POLLING_HTTP_REQUEST] ✓ 满足条件")
-                                break
 
                 except requests.exceptions.RequestException as e:
                     error_msg = f"请求失败: {str(e)}"
@@ -635,7 +728,7 @@ class CONCURRENT_HTTP_REQUEST:
         method = config["method"]
         print(f"[CONCURRENT_HTTP_REQUEST] 任务 #{index} 发送 {method} {config['url']}")
 
-        response = requests.request(
+        response = HTTP_SESSION.request(
             method,
             config["url"],
             headers=config["headers"],
@@ -654,7 +747,7 @@ class CONCURRENT_HTTP_REQUEST:
         submit_method = config["method"]
         print(f"[CONCURRENT_HTTP_REQUEST] 任务 #{index} [异步] 提交 {submit_method} {config['url']}")
 
-        submit_response = requests.request(
+        submit_response = HTTP_SESSION.request(
             submit_method,
             config["url"],
             headers=config["headers"],
@@ -697,7 +790,7 @@ class CONCURRENT_HTTP_REQUEST:
 
             print(f"[CONCURRENT_HTTP_REQUEST] 任务 #{index} [异步] 轮询 {attempt}/{max_poll_attempts}")
 
-            poll_response = requests.request(
+            poll_response = HTTP_SESSION.request(
                 poll_method,
                 poll_url,
                 headers=config["headers"],
@@ -706,6 +799,11 @@ class CONCURRENT_HTTP_REQUEST:
                 timeout=config["timeout"],
                 verify=False,
             )
+            print(f"poll_url: {poll_url}")
+            print(f"poll_method: {poll_method}")
+            print(f"poll_headers: {config['headers']}")
+            print(f"poll_params: {poll_params}")
+            print(f"poll_response: {poll_response}")
             poll_response.raise_for_status()
 
             try:
@@ -799,7 +897,7 @@ class ASYNC_TASK_HTTP_REQUEST(POLLING_HTTP_REQUEST):
             print(f"[ASYNC_TASK_HTTP_REQUEST] 提交任务: {submit_endpoint}")
             print(f"[ASYNC_TASK_HTTP_REQUEST] 提交参数: {json.dumps(submit_body, ensure_ascii=False)}")
 
-            submit_response = requests.request(
+            submit_response = HTTP_SESSION.request(
                 submit_method,
                 submit_endpoint.strip(),
                 headers=real_headers,
