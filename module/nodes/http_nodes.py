@@ -162,6 +162,18 @@ def _format_response_text(response):
         return response.text
 
 
+# 轮询场景下可以重试的错误状态码：5xx 一般是服务端偶发抖动，
+# 408/429 是明确要求稍后重试，其余 4xx 属于请求本身有问题，重试没有意义。
+_RETRYABLE_STATUS_CODES = {408, 429}
+
+
+def _is_fatal_status(status_code):
+    """判断该HTTP错误状态码是否为不可重试的确定性错误（客户端错误）。"""
+    if status_code in _RETRYABLE_STATUS_CODES:
+        return False
+    return 400 <= status_code < 500
+
+
 def _get_nested_value(data, path):
     """
     获取嵌套字段的值
@@ -212,6 +224,59 @@ def _check_condition(current_value, expected_value):
         return str(current_value) != not_value
 
     return False
+
+
+# 远端任务进入终态失败后，状态不可能再变化，继续轮询纯属浪费时间。
+_DEFAULT_FAILURE_VALUES = "FAILED,FAIL,ERROR,CANCELLED,CANCELED,REJECTED,EXPIRED"
+
+# 终态失败响应中常见的原因字段，命中后打印出来便于直接定位问题。
+_FAILURE_REASON_FIELDS = (
+    "failReason", "fail_reason", "failureReason", "failure_reason",
+    "message", "msg", "error", "errorMessage", "error_message",
+    "data.failReason", "data.message", "data.error",
+)
+
+
+def _match_failure_value(current_value, failure_values):
+    """
+    失败值匹配：大小写不敏感（接口常见 FAILED / failed / Failed 混用）。
+    以 contains: / not: 开头时交给 _check_condition 保持原有语义。
+    """
+    if failure_values.startswith("contains:") or failure_values.startswith("not:"):
+        return _check_condition(current_value, failure_values)
+
+    normalized = str(current_value).strip().upper()
+    candidates = [v.strip().upper() for v in failure_values.split(',') if v.strip()]
+    return normalized in candidates
+
+
+def _detect_terminal_failure(response_data, failure_field, failure_values):
+    """
+    检测响应体中是否存在终态失败标识（HTTP 200 但业务失败的场景）。
+
+    返回 (是否失败, 命中的状态值, 失败原因)；failure_values 为空时视为关闭该检测。
+    """
+    if not failure_values or not str(failure_values).strip():
+        return False, None, None
+
+    if not failure_field or not str(failure_field).strip():
+        return False, None, None
+
+    current_value = _get_nested_value(response_data, failure_field)
+    if current_value is None:
+        return False, None, None
+
+    if not _match_failure_value(current_value, str(failure_values).strip()):
+        return False, None, None
+
+    reason = None
+    for field in _FAILURE_REASON_FIELDS:
+        candidate = _get_nested_value(response_data, field)
+        if candidate is not None and str(candidate).strip():
+            reason = str(candidate).strip()
+            break
+
+    return True, current_value, reason
 
 
 def _inject_task_id(template_value, task_id, placeholder="{task_id}"):
@@ -362,6 +427,8 @@ class POLLING_HTTP_REQUEST:
                 "headers": ("STRING", {"default": ""}),
                 "timeout": ("INT", {"default": 30, "min": 1, "max": 600}),
                 "stop_on_error": ("BOOLEAN", {"default": True, "tooltip": "遇到错误时是否立即停止"}),
+                "failure_field": ("STRING", {"default": "", "tooltip": "失败标识字段路径，留空则复用 condition_field"}),
+                "failure_values": ("STRING", {"default": _DEFAULT_FAILURE_VALUES, "tooltip": "命中即视为终态失败并立即停止轮询，留空则关闭该检测"}),
             },
         }
 
@@ -376,7 +443,8 @@ class POLLING_HTTP_REQUEST:
 
     def poll_request(self, method, api_endpoint, params, poll_interval, max_attempts,
                      success_condition, condition_field, expected_value,
-                     api_key="", headers="", timeout=30, stop_on_error=True):
+                     api_key="", headers="", timeout=30, stop_on_error=True,
+                     failure_field="", failure_values=_DEFAULT_FAILURE_VALUES):
         """
         执行轮询请求
         """
@@ -414,6 +482,11 @@ class POLLING_HTTP_REQUEST:
             print(f"[POLLING_HTTP_REQUEST] 开始轮询: {api_endpoint}")
             print(f"[POLLING_HTTP_REQUEST] 最大尝试次数: {max_attempts}, 间隔: {poll_interval}秒")
 
+            # 失败字段留空时复用成功条件字段：大多数接口的 status 同时承载成功与失败状态
+            effective_failure_field = failure_field.strip() if failure_field and failure_field.strip() else condition_field
+            if failure_values and str(failure_values).strip():
+                print(f"[POLLING_HTTP_REQUEST] 终态失败检测: {effective_failure_field} ∈ [{failure_values}]")
+
             attempts = 0
             last_response = None
             last_status = "未开始"
@@ -447,12 +520,18 @@ class POLLING_HTTP_REQUEST:
                         else:
                             last_status = f"HTTP {response.status_code}"
                             last_response = response.text
+                            if stop_on_error and _is_fatal_status(response.status_code):
+                                print(f"[POLLING_HTTP_REQUEST] ✗ HTTP {response.status_code} 为确定性错误，停止轮询: {_truncate_for_log(response.text)}")
+                                break
                     else:
                         # 先检查HTTP状态码，不成功的话记录
                         if response.status_code < 200 or response.status_code >= 300:
                             last_status = f"HTTP {response.status_code}"
                             last_response = response.text
                             print(f"[POLLING_HTTP_REQUEST] HTTP {response.status_code}: {_truncate_for_log(response.text)}")
+                            if stop_on_error and _is_fatal_status(response.status_code):
+                                print(f"[POLLING_HTTP_REQUEST] ✗ HTTP {response.status_code} 为确定性错误，停止轮询")
+                                break
                         else:
                             # 解析响应
                             try:
@@ -472,8 +551,19 @@ class POLLING_HTTP_REQUEST:
                                     success = True
                                     print(f"[POLLING_HTTP_REQUEST] ✓ 成功: {condition_field}={current_value}")
                                     break
-                                else:
-                                    print(f"[POLLING_HTTP_REQUEST] 当前状态: {condition_field}={current_value}, 期望: {expected_value}")
+
+                                # 未成功时，检查是否已进入终态失败
+                                failed, failed_value, fail_reason = _detect_terminal_failure(
+                                    response_data, effective_failure_field, failure_values
+                                )
+                                if failed:
+                                    last_status = str(failed_value)
+                                    print(f"[POLLING_HTTP_REQUEST] ✗ 终态失败: {effective_failure_field}={failed_value}")
+                                    if fail_reason:
+                                        print(f"[POLLING_HTTP_REQUEST] ✗ 失败原因: {_truncate_for_log(fail_reason)}")
+                                    break
+
+                                print(f"[POLLING_HTTP_REQUEST] 当前状态: {condition_field}={current_value}, 期望: {expected_value}")
 
                             elif success_condition == "custom_jsonpath":
                                 current_value = _get_nested_value(response_data, condition_field)
@@ -482,6 +572,16 @@ class POLLING_HTTP_REQUEST:
                                 if _check_condition(current_value, expected_value):
                                     success = True
                                     print(f"[POLLING_HTTP_REQUEST] ✓ 满足条件")
+                                    break
+
+                                failed, failed_value, fail_reason = _detect_terminal_failure(
+                                    response_data, effective_failure_field, failure_values
+                                )
+                                if failed:
+                                    last_status = str(failed_value)
+                                    print(f"[POLLING_HTTP_REQUEST] ✗ 终态失败: {effective_failure_field}={failed_value}")
+                                    if fail_reason:
+                                        print(f"[POLLING_HTTP_REQUEST] ✗ 失败原因: {_truncate_for_log(fail_reason)}")
                                     break
 
                 except requests.exceptions.RequestException as e:
@@ -510,8 +610,10 @@ class POLLING_HTTP_REQUEST:
             # 输出最终结果
             if success:
                 print(f"[POLLING_HTTP_REQUEST] ✓ 轮询成功，共尝试 {attempts} 次")
-            else:
+            elif attempts >= max_attempts:
                 print(f"[POLLING_HTTP_REQUEST] ✗ 轮询失败，已达最大尝试次数 {attempts}")
+            else:
+                print(f"[POLLING_HTTP_REQUEST] ✗ 轮询失败，第 {attempts} 次尝试遇到错误后提前终止 ({last_status})")
 
             final_response = last_response if last_response else json.dumps({"error": "无响应数据"}, ensure_ascii=False)
 
@@ -865,6 +967,8 @@ class ASYNC_TASK_HTTP_REQUEST(POLLING_HTTP_REQUEST):
                 "timeout": ("INT", {"default": 30, "min": 1, "max": 600}),
                 "stop_on_error": ("BOOLEAN", {"default": True, "tooltip": "遇到错误时是否立即停止"}),
                 "task_id_placeholder": ("STRING", {"default": "{task_id}", "tooltip": "在轮询地址和参数中替换任务ID的占位符"}),
+                "failure_field": ("STRING", {"default": "", "tooltip": "失败标识字段路径，留空则复用 condition_field"}),
+                "failure_values": ("STRING", {"default": _DEFAULT_FAILURE_VALUES, "tooltip": "命中即视为终态失败并立即停止轮询，留空则关闭该检测"}),
             },
         }
 
@@ -881,7 +985,8 @@ class ASYNC_TASK_HTTP_REQUEST(POLLING_HTTP_REQUEST):
                          poll_method, poll_endpoint, poll_params, poll_interval, max_attempts,
                          success_condition, condition_field, expected_value,
                          api_key="", headers="", timeout=30, stop_on_error=True,
-                         task_id_placeholder="{task_id}"):
+                         task_id_placeholder="{task_id}",
+                         failure_field="", failure_values=_DEFAULT_FAILURE_VALUES):
         try:
             if not submit_endpoint or submit_endpoint.strip() == "":
                 raise ValueError("提交API端点不能为空")
@@ -940,6 +1045,8 @@ class ASYNC_TASK_HTTP_REQUEST(POLLING_HTTP_REQUEST):
                 headers=headers,
                 timeout=timeout,
                 stop_on_error=stop_on_error,
+                failure_field=failure_field,
+                failure_values=failure_values,
             )
 
             return (

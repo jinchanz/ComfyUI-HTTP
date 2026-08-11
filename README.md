@@ -85,12 +85,21 @@ pip install -r requirements.txt
 | `headers` | STRING | ❌ | `""` | 自定义请求头 JSON |
 | `timeout` | INT | ❌ | `30` | 单次请求超时时间（秒） |
 | `stop_on_error` | BOOLEAN | ❌ | `True` | 遇到错误时是否立即停止 |
+| `failure_field` | STRING | ❌ | `""` | 失败标识字段路径，留空则复用 `condition_field` |
+| `failure_values` | STRING | ❌ | `FAILED,FAIL,ERROR,CANCELLED,CANCELED,REJECTED,EXPIRED` | 命中即视为终态失败并立即停止，留空则关闭该检测 |
 
 **成功条件说明：**
 
 - **`status_field`**：检查响应中指定字段路径的值是否等于期望值
 - **`custom_jsonpath`**：支持多值匹配（逗号分隔）、包含判断（`contains:xxx`）、否定判断（`not:xxx`）
 - **`status_code_only`**：仅检查 HTTP 状态码是否为 200
+
+**提前终止说明：**
+
+轮询在以下两种情况下不会耗完 `max_attempts` 而是立即返回：
+
+1. **确定性 HTTP 错误**（需 `stop_on_error=True`）：4xx 表示请求本身有问题，重试无意义，立即停止。5xx / 408 / 429 视为服务端抖动或限流，仍继续轮询。
+2. **终态业务失败**：HTTP 200 但响应体状态字段命中 `failure_values`（如 `status: FAILED`）。远端任务状态机已进入终态，继续轮询不可能改变结果，因此**无条件停止，不受 `stop_on_error` 约束**。命中后会自动从 `failReason` / `message` / `error` 等常见字段提取失败原因打印到日志。值匹配大小写不敏感。
 
 **输出：**
 
@@ -128,6 +137,8 @@ pip install -r requirements.txt
 | `timeout` | INT | ❌ | `30` | 单次请求超时时间（秒） |
 | `stop_on_error` | BOOLEAN | ❌ | `True` | 遇到错误时是否立即停止 |
 | `task_id_placeholder` | STRING | ❌ | `{task_id}` | 轮询地址和参数中的任务 ID 占位符 |
+| `failure_field` | STRING | ❌ | `""` | 失败标识字段路径，留空则复用 `condition_field` |
+| `failure_values` | STRING | ❌ | `FAILED,FAIL,ERROR,CANCELLED,CANCELED,REJECTED,EXPIRED` | 命中即视为终态失败并立即停止，留空则关闭该检测 |
 
 **输出：**
 
